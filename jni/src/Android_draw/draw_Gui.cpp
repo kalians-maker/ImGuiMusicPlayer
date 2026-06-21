@@ -315,9 +315,14 @@ void Layout_tick_UI(bool *main_thread_flag) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, s_CurrentState == STATE_ISLAND ? 24.0f : 14.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     
-    // 【核心修复】压入绝对透明的边框及阴影颜色色值，从物理底层断绝用户调节大小时偶尔闪烁出白线的 Bug
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    ImGui::PushStyleColor(ImGuiCol_BorderShadow, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+ //彻底消除边框、阴影和手柄残留的白线
+ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+ImGui::PushStyleColor(ImGuiCol_BorderShadow, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+
+// 新增：调整大小手柄及其悬停/激活状态设为全透明（这是白线的常见来源）
+ImGui::PushStyleColor(ImGuiCol_ResizeGrip, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::GetStyle().WindowBorderSize = 0.0f; // 彻底去掉窗口边框
     
     ImGuiWindowFlags winFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar;
@@ -338,7 +343,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
         s_UserH = winSize.y;
     }
 
-    drawList->AddRectFilled(winPos, ImVec2(winPos.x + winSize.x, winPos.y + winSize.y), ImColor(10, 11, 14, 252), ImGui::GetStyle().WindowRounding);
+    drawList->AddRectFilled(winPos, ImVec2(winPos.x + winSize.x, winPos.y + winSize.y), ImColor(ImVec4(0.08f, 0.08f, 0.08f, 1.0f)), ImGui::GetStyle().WindowRounding);
 
     // ─── 形态 1：苹果同款高级灵动岛形态 (Marquee Mini Mode) ───
     if (s_CurrentState == STATE_ISLAND || s_ContentAlpha < 0.15f) {
@@ -597,8 +602,8 @@ void Layout_tick_UI(bool *main_thread_flag) {
     ImGui::End();
     
     // 清理 PushStyleColor 的 Border 变量
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(2); 
+    ImGui::PopStyleColor(7); // 因为我们一共 Push 了 7 个颜色（原有2个 + 新增5个）
+ImGui::PopStyleVar(2);   // 弹出2个 Var
 
     Touch::SetTouchObstacle(WindowPos, WindowSize, WindowCount);
 }
