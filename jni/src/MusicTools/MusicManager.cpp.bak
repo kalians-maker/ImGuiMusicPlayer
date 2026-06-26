@@ -1,0 +1,261 @@
+// 必须在包含 miniaudio.h 之前定义此宏，代表在当前源文件中生成 miniaudio 的全部底层实现代码
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+#include "MusicManager.h"
+#include <mutex>       // 引入互斥锁，用于解决 UI 线程与底层音频渲染线程的并发冲突
+#include <dirent.h>    // 引入 POSIX 标准目录操作库，用于扫描手机文件夹
+#include <cstring>
+
+namespace Music {
+    // ==========================================
+    // 静态全局变量定义（通过 static 限制作用域，仅限本文件访问）
+    // ==========================================
+    static ma_context g_AudioContext;     
+    static ma_device  g_AudioDevice;       // 手工托管定制设备流
+    static ma_engine  g_AudioEngine;       
+    static ma_sound   g_CurrentSound;       
+    
+    static bool g_IsContextInit = false;  
+    static bool g_IsDeviceInit  = false;  
+    static bool g_IsEngineInit  = false;   
+    static bool g_IsSoundLoaded = false;  
+    static std::string g_CurrentTitle = "未在播放"; 
+    
+    static std::mutex g_AudioMutex;
+
+    static std::string g_CurrentFolderPath = ""; 
+    static std::vector<std::string> g_SongFiles; 
+
+    // 音频数据底层桥接回调函数
+    static void CustomAudioDataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        ma_engine* pEngine = (ma_engine*)pDevice->pUserData;
+        if (pEngine) {
+            ma_engine_read_pcm_frames(pEngine, pOutput, frameCount, NULL);
+        }
+        (void)pInput;
+    }
+
+    // ==========================================
+    // 核心功能实现
+    // ==========================================
+
+    bool Init() {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        if (g_IsEngineInit) return true;
+
+        // 强行锁定 OpenSL ES 驱动后端后端
+        ma_backend backends[] = { ma_backend_opensl };
+        if (ma_context_init(backends, 1, NULL, &g_AudioContext) != MA_SUCCESS) {
+            return false; 
+        }
+        g_IsContextInit = true;
+
+        // 1. 初始化引擎混音内核
+        ma_engine_config engineConfig = ma_engine_config_init();
+        engineConfig.pContext = &g_AudioContext;
+        engineConfig.noDevice = MA_TRUE; // 掐断默认硬件关联
+        if (ma_engine_init(&engineConfig, &g_AudioEngine) != MA_SUCCESS) {
+            ma_context_uninit(&g_AudioContext);
+            g_IsContextInit = false;
+            return false;
+        }
+
+        // 2. 【联想 Y700 四代 root 外放静音 Bug 终极核心修复】
+        // 手工配置设备流，强行将 streamType 锚定为 ma_opensl_stream_type_system（系统级通知反馈流类型）
+        // 该类型通道拥有极高的路由优先级，能完美穿透联想 ZUI 固件对 root 终端的隔离过滤，强制分发至扬声器外放！
+        ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+        deviceConfig.playback.format   = ma_format_f32;
+        deviceConfig.playback.channels = 2;      
+        deviceConfig.sampleRate        = 44100;  
+        deviceConfig.dataCallback      = CustomAudioDataCallback;
+        deviceConfig.pUserData         = &g_AudioEngine;
+        deviceConfig.opensl.streamType = ma_opensl_stream_type_system; 
+
+        // 稳健初始化：如果系统级通道在特殊魔改Rom上受限，自动降级回标准媒体通道保底，确保绝不失败
+        if (ma_device_init(&g_AudioContext, &deviceConfig, &g_AudioDevice) != MA_SUCCESS) {
+            deviceConfig.opensl.streamType = ma_opensl_stream_type_media;
+            if (ma_device_init(&g_AudioContext, &deviceConfig, &g_AudioDevice) != MA_SUCCESS) {
+                ma_engine_uninit(&g_AudioEngine);
+                ma_context_uninit(&g_AudioContext);
+                g_IsContextInit = false;
+                return false;
+            }
+        }
+        g_IsDeviceInit = true;
+
+        if (ma_device_start(&g_AudioDevice) != MA_SUCCESS) {
+            ma_device_uninit(&g_AudioDevice);
+            ma_engine_uninit(&g_AudioEngine);
+            ma_context_uninit(&g_AudioContext);
+            g_IsDeviceInit = false;
+            g_IsContextInit = false;
+            return false;
+        }
+        
+        g_IsEngineInit = true; 
+        return true;
+    }
+
+    void Shutdown() {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        if (g_IsSoundLoaded) {
+            ma_sound_uninit(&g_CurrentSound);
+            g_IsSoundLoaded = false;
+        }
+        if (g_IsDeviceInit) {
+            ma_device_uninit(&g_AudioDevice);
+            g_IsDeviceInit = false;
+        }
+        if (g_IsEngineInit) {
+            ma_engine_uninit(&g_AudioEngine);
+            g_IsEngineInit = false;
+        }
+        if (g_IsContextInit) {
+            ma_context_uninit(&g_AudioContext);
+            g_IsContextInit = false;
+        }
+    }
+
+    bool PlayFile(const std::string& filePath) {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        if (!g_IsEngineInit) return false; 
+
+        if (g_IsSoundLoaded) {
+            ma_sound_uninit(&g_CurrentSound);
+            g_IsSoundLoaded = false;
+        }
+
+        ma_result result = ma_sound_init_from_file(
+            &g_AudioEngine, 
+            filePath.c_str(), 
+            MA_SOUND_FLAG_STREAM, 
+            NULL, 
+            NULL, 
+            &g_CurrentSound
+        );
+
+        if (result != MA_SUCCESS) {
+            g_CurrentTitle = "播放失败";
+            return false; 
+        }
+
+        g_IsSoundLoaded = true; 
+        size_t lastSlash = filePath.find_last_of("/\\");
+        if (lastSlash != std::string::npos) {
+            g_CurrentTitle = filePath.substr(lastSlash + 1);
+        } else {
+            g_CurrentTitle = filePath;
+        }
+
+        ma_sound_start(&g_CurrentSound);
+        return true;
+    }
+
+    void TogglePlay() {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        if (!g_IsSoundLoaded) return; 
+        if (ma_sound_is_playing(&g_CurrentSound)) {
+            ma_sound_stop(&g_CurrentSound); 
+        } else {
+            ma_sound_start(&g_CurrentSound); 
+        }
+    }
+
+    void SetVolume(float volume) {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        if (!g_IsSoundLoaded) return;
+        ma_sound_set_volume(&g_CurrentSound, volume);
+    }
+
+    void SetProgress(float pct) {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        if (!g_IsSoundLoaded) return;
+        ma_uint64 totalFrames = 0;
+        ma_sound_get_length_in_pcm_frames(&g_CurrentSound, &totalFrames);
+        ma_uint64 targetFrame = (ma_uint64)(totalFrames * pct);
+        ma_sound_seek_to_pcm_frame(&g_CurrentSound, targetFrame);
+    }
+
+    // 全部采用非阻塞 try_to_lock 状态锁，全面消除滑动一卡一卡与杜比音效关闭时的线程死锁
+    float GetProgress() {
+        std::unique_lock<std::mutex> lock(g_AudioMutex, std::try_to_lock);
+        if (!lock.owns_lock() || !g_IsSoundLoaded) return 0.0f; 
+        ma_uint64 totalFrames = 0;
+        ma_sound_get_length_in_pcm_frames(&g_CurrentSound, &totalFrames);
+        if (totalFrames == 0) return 0.0f; 
+        ma_uint64 currentFrame = 0;
+        ma_sound_get_cursor_in_pcm_frames(&g_CurrentSound, &currentFrame);
+        return (float)currentFrame / (float)totalFrames;
+    }
+
+    void GetTimeStr(char* buffer, int maxLen) {
+        std::unique_lock<std::mutex> lock(g_AudioMutex, std::try_to_lock);
+        if (!lock.owns_lock() || !g_IsSoundLoaded || maxLen < 15) {
+            snprintf(buffer, maxLen, "00:00 / 00:00");
+            return;
+        }
+        ma_uint32 sampleRate = ma_engine_get_sample_rate(&g_AudioEngine);
+        ma_uint64 totalFrames = 0;
+        ma_sound_get_length_in_pcm_frames(&g_CurrentSound, &totalFrames);
+        ma_uint64 currentFrame = 0;
+        ma_sound_get_cursor_in_pcm_frames(&g_CurrentSound, &currentFrame);
+        
+        float lengthInSeconds = 0.0f;
+        float currentInSeconds = 0.0f;
+        if (sampleRate > 0) {
+            lengthInSeconds = (float)totalFrames / sampleRate;
+            currentInSeconds = (float)currentFrame / sampleRate;
+        }
+        int curMin = (int)currentInSeconds / 60;
+        int curSec = (int)currentInSeconds % 60;
+        int lenMin = (int)lengthInSeconds / 60;
+        int lenSec = (int)lengthInSeconds % 60;
+        snprintf(buffer, maxLen, "%02d:%02d / %02d:%02d", curMin, curSec, lenMin, lenSec);
+    }
+
+    bool IsPlaying() {
+        std::unique_lock<std::mutex> lock(g_AudioMutex, std::try_to_lock);
+        if (!lock.owns_lock() || !g_IsSoundLoaded) return false;
+        return ma_sound_is_playing(&g_CurrentSound);
+    }
+
+    const char* GetCurrentTitle() {
+        return g_CurrentTitle.c_str();
+    }
+
+    void ScanMusicFolder(const std::string& folderPath) {
+        std::lock_guard<std::mutex> lock(g_AudioMutex);
+        g_CurrentFolderPath = folderPath;
+        if (g_CurrentFolderPath.back() != '/') {
+            g_CurrentFolderPath += "/";
+        }
+        g_SongFiles.clear(); 
+        DIR* dir = opendir(folderPath.c_str());
+        if (!dir) return; 
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strstr(entry->d_name, ".mp3") || 
+                strstr(entry->d_name, ".flac") || 
+                strstr(entry->d_name, ".wav") ||
+                strstr(entry->d_name, ".ogg")) {
+                g_SongFiles.push_back(entry->d_name);
+            }
+        }
+        closedir(dir); 
+    }
+
+    const std::vector<std::string>& GetSongList() {
+        return g_SongFiles; 
+    }
+
+    bool PlayAtIndex(int index) {
+        std::string fullPath;
+        {
+            std::lock_guard<std::mutex> lock(g_AudioMutex);
+            if (index < 0 || index >= (int)g_SongFiles.size()) return false; 
+            fullPath = g_CurrentFolderPath + g_SongFiles[index];
+        }
+        return PlayFile(fullPath);
+    }
+}

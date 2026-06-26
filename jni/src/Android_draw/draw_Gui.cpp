@@ -563,6 +563,8 @@ ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f))
             ImGui::Text("[+] 你应该在 /storage/emulated/0/Music/BoxMusic 里面存放你的音频和lrc歌词");            
             ImGui::Text("[+] 我打算将本项目设为开源项目，禁止二改后进行圈钱行为");
             ImGui::Text("[+] 祝您使用愉快~");
+            ImGui::Text("[+] 抖音号:ACoier0409cpp");
+            ImGui::Text("[+] 哔哩哔哩:UID:3546556374452457");
             
             ImGui::SetWindowFontScale(1.0f);
             ImGui::PopStyleColor(); // 恢复默认颜色
